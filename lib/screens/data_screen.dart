@@ -1,48 +1,44 @@
 import 'package:flutter/material.dart';
-import '../widgets/app_layout.dart';
 
 class DataScreen extends StatelessWidget {
   const DataScreen({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return AppLayout(
-      currentIndex: 2,
-      child: Column(
-        children: [
-          AppBar(
-            title: const Text('Data Management'),
+    return Column(
+      children: [
+        AppBar(
+          title: const Text('Data Management'),
+        ),
+        Expanded(
+          child: GridView.count(
+            padding: const EdgeInsets.all(16),
+            crossAxisCount: 2,
+            crossAxisSpacing: 16,
+            mainAxisSpacing: 16,
+            children: [
+              _DataCard(
+                title: 'Items',
+                icon: Icons.inventory,
+                color: Colors.blue,
+                onTap: () => Navigator.pushReplacementNamed(context, '/items'),
+              ),
+              _DataCard(
+                title: 'Warehouses',
+                icon: Icons.warehouse,
+                color: Colors.green,
+                onTap: () => Navigator.pushReplacementNamed(context, '/warehouses'),
+              ),
+              _DataCard(
+                title: 'Item Groups',
+                icon: Icons.category,
+                color: Colors.purple,
+                onTap: () => Navigator.pushReplacementNamed(context, '/item-groups'),
+              ),
+            ],
           ),
-          Expanded(
-            child: GridView.count(
-              padding: const EdgeInsets.all(16),
-              crossAxisCount: 2,
-              crossAxisSpacing: 16,
-              mainAxisSpacing: 16,
-              children: [
-                _DataCard(
-                  title: 'Items',
-                  icon: Icons.inventory,
-                  color: Colors.blue,
-                  onTap: () => Navigator.pushNamed(context, '/items'),
-                ),
-                _DataCard(
-                  title: 'Warehouses',
-                  icon: Icons.warehouse,
-                  color: Colors.green,
-                  onTap: () => Navigator.pushNamed(context, '/warehouses'),
-                ),
-                _DataCard(
-                  title: 'Item Groups',
-                  icon: Icons.category,
-                  color: Colors.purple,
-                  onTap: () => Navigator.pushNamed(context, '/item-groups'),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 }

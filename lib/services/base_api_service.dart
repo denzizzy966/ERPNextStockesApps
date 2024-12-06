@@ -1,13 +1,29 @@
 import 'package:dio/dio.dart';
+import 'package:dio_cache_interceptor/dio_cache_interceptor.dart';
+import 'package:dio_smart_retry/dio_smart_retry.dart';
 
 class BaseApiService {
   final Dio _dio = Dio();
   final String baseUrl = 'https://halosocia.com';
   String? _sessionId;
 
+  // Cache options
+  final _cacheOptions = CacheOptions(
+    store: MemCacheStore(),
+    policy: CachePolicy.refreshForceCache,
+    hitCacheOnErrorExcept: [401, 403], // Don't cache error responses except auth errors
+    maxStale: const Duration(days: 1), // Maximum age of cached response
+    priority: CachePriority.normal,
+  );
+
   BaseApiService() {
     _dio.options.baseUrl = baseUrl;
     _dio.options.validateStatus = (status) => status! < 500;
+    _dio.options.connectTimeout = const Duration(seconds: 30);
+    _dio.options.receiveTimeout = const Duration(seconds: 30);
+    _dio.options.sendTimeout = const Duration(seconds: 30);
+
+    // Add logging interceptor
     _dio.interceptors.add(LogInterceptor(
       requestBody: true,
       responseBody: true,
@@ -16,7 +32,22 @@ class BaseApiService {
       responseHeader: true,
     ));
 
-    // Add interceptor to handle session cookie
+    // Add retry interceptor
+    _dio.interceptors.add(RetryInterceptor(
+      dio: _dio,
+      logPrint: print,
+      retries: 3,
+      retryDelays: const [
+        Duration(seconds: 1),
+        Duration(seconds: 2),
+        Duration(seconds: 3),
+      ],
+    ));
+
+    // Add cache interceptor
+    _dio.interceptors.add(DioCacheInterceptor(options: _cacheOptions));
+
+    // Add session cookie interceptor
     _dio.interceptors.add(InterceptorsWrapper(
       onRequest: (options, handler) {
         if (_sessionId != null) {
@@ -27,19 +58,32 @@ class BaseApiService {
       onResponse: (response, handler) {
         final cookies = response.headers['set-cookie'];
         if (cookies != null && cookies.isNotEmpty) {
-          // Look for any sid cookie, including Guest
           final sidCookie = cookies.firstWhere(
             (cookie) => cookie.startsWith('sid='),
             orElse: () => '',
           );
           
-          // Only update if it's not a Guest session
           if (sidCookie.isNotEmpty && !sidCookie.contains('sid=Guest')) {
             _sessionId = sidCookie.split(';').first;
             updateSessionCookie(_sessionId);
           }
         }
         return handler.next(response);
+      },
+      onError: (error, handler) {
+        // Handle network errors
+        if (error.type == DioExceptionType.connectionTimeout ||
+            error.type == DioExceptionType.sendTimeout ||
+            error.type == DioExceptionType.receiveTimeout) {
+          return handler.next(
+            DioException(
+              requestOptions: error.requestOptions,
+              error: 'Network timeout. Please check your connection.',
+              type: error.type,
+            ),
+          );
+        }
+        return handler.next(error);
       },
     ));
   }
@@ -57,19 +101,25 @@ class BaseApiService {
 
   // Permission check helper
   Future<void> checkPermissions(String doctype, List<String> requiredRoles) async {
-    // Skip permission check if no session (during login)
     if (_sessionId == null) return;
 
     try {
-      // Get current user
-      final userResponse = await _dio.get('/api/method/frappe.auth.get_logged_user');
+      // Get current user with cache
+      final userResponse = await _dio.get(
+        '/api/method/frappe.auth.get_logged_user',
+        options: Options(extra: {
+          'cache': true,
+          'maxAge': const Duration(minutes: 5),
+        }),
+      );
+      
       if (userResponse.data == null || userResponse.data['message'] == null) {
         throw Exception('Unable to verify user permissions');
       }
 
       final username = userResponse.data['message'];
       
-      // Get user roles
+      // Get user roles with cache
       final response = await _dio.get(
         '/api/method/frappe.client.get',
         queryParameters: {
@@ -77,6 +127,10 @@ class BaseApiService {
           'name': username,
           'fields': '["user_roles"]'
         },
+        options: Options(extra: {
+          'cache': true,
+          'maxAge': const Duration(minutes: 5),
+        }),
       );
 
       if (response.data == null || 
@@ -99,57 +153,44 @@ class BaseApiService {
   Exception handleError(dynamic error) {
     if (error is DioException) {
       print('DioError Details:');
-      print('- Type: ${error.type}');
-      print('- Message: ${error.message}');
-      print('- Response: ${error.response?.data}');
+      print('Type: ${error.type}');
+      print('Message: ${error.message}');
+      print('Status code: ${error.response?.statusCode}');
+      print('Response data: ${error.response?.data}');
       
-      if (error.response?.statusCode == 403) {
-        // Check if session is expired or invalid
-        if (_sessionId != null) {
-          // Clear invalid session
-          updateSessionCookie(null);
-        }
-        return Exception('Permission denied: Please check your access rights or try logging in again');
-      }
-      
-      if (error.response?.statusCode == 500) {
-        return Exception('Server error: The operation could not be completed. Please try again later.');
-      }
-      
-      if (error.response != null) {
-        var errorMessage = '';
-        
-        if (error.response?.data is String) {
-          errorMessage = error.response?.data;
-        } else if (error.response?.data is Map) {
-          errorMessage = error.response?.data['_server_messages'] ?? 
-                        error.response?.data['message'] ?? 
-                        error.response?.data['exc_type'] ?? 
-                        error.response?.data.toString();
-                        
-          if (errorMessage.contains('{') && errorMessage.contains('}')) {
-            try {
-              errorMessage = errorMessage.replaceAll('\\"', '"');
-              errorMessage = errorMessage.replaceAll('\\\\', '\\');
-              
-              final start = errorMessage.indexOf('"message":');
-              if (start != -1) {
-                final messageStart = errorMessage.indexOf('"', start + 10) + 1;
-                final messageEnd = errorMessage.indexOf('"', messageStart);
-                if (messageStart != -1 && messageEnd != -1) {
-                  errorMessage = errorMessage.substring(messageStart, messageEnd);
-                }
-              }
-            } catch (e) {
-              print('Error parsing error message: $e');
-            }
+      switch (error.type) {
+        case DioExceptionType.connectionTimeout:
+        case DioExceptionType.sendTimeout:
+        case DioExceptionType.receiveTimeout:
+          return Exception('Network timeout. Please check your connection and try again.');
+        case DioExceptionType.badResponse:
+          final statusCode = error.response?.statusCode;
+          final message = error.response?.data?['message'] ?? error.response?.data?['error'] ?? error.message;
+          switch (statusCode) {
+            case 401:
+              return Exception('Unauthorized: Please log in again');
+            case 403:
+              return Exception('Forbidden: You do not have permission to perform this action');
+            case 404:
+              return Exception('Not found: The requested resource does not exist');
+            case 422:
+              return Exception('Validation error: ${message ?? 'Invalid data provided'}');
+            default:
+              return Exception('Server error: ${message ?? 'Something went wrong'}');
           }
-        }
-        
-        return Exception(errorMessage);
+        case DioExceptionType.cancel:
+          return Exception('Request cancelled');
+        case DioExceptionType.unknown:
+          if (error.error is Exception) {
+            return error.error as Exception;
+          }
+          return Exception('An unexpected error occurred: ${error.message}');
+        default:
+          return Exception('Network error: ${error.message}');
       }
-      return Exception(error.message ?? 'An error occurred');
     }
-    return Exception('An unexpected error occurred');
+    
+    print('Non-Dio error: $error');
+    return error is Exception ? error : Exception(error.toString());
   }
 }
