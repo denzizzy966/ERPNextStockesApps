@@ -1,8 +1,23 @@
 import 'package:dio/dio.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'base_api_service.dart';
 
 class AuthService extends BaseApiService {
   String? _userIp;
+  static const String _sessionKey = 'session_cookie';
+  late SharedPreferences _prefs;
+
+  AuthService() {
+    _initPrefs();
+  }
+
+  Future<void> _initPrefs() async {
+    _prefs = await SharedPreferences.getInstance();
+    final savedSession = _prefs.getString(_sessionKey);
+    if (savedSession != null) {
+      updateSessionCookie(savedSession);
+    }
+  }
 
   Future<Map<String, dynamic>> getUserDetails(String username) async {
     try {
@@ -33,7 +48,7 @@ class AuthService extends BaseApiService {
   Future<Map<String, dynamic>> login(String username, String password) async {
     try {
       // Clear any existing session
-      updateSessionCookie(null);
+      await logout();
 
       // First login to get session
       final loginResponse = await dio.post(
@@ -43,7 +58,6 @@ class AuthService extends BaseApiService {
           'pwd': password,
         },
         options: Options(
-          // Ensure we follow redirects and handle cookies
           followRedirects: true,
           validateStatus: (status) => status! < 500,
           headers: {
@@ -58,6 +72,22 @@ class AuthService extends BaseApiService {
       }
       
       if (loginResponse.data['message'] == 'Logged In') {
+        // Get session cookie from response
+        final cookies = loginResponse.headers['set-cookie'];
+        if (cookies != null && cookies.isNotEmpty) {
+          final sidCookie = cookies.firstWhere(
+            (cookie) => cookie.startsWith('sid=') && !cookie.contains('Guest'),
+            orElse: () => '',
+          );
+          
+          if (sidCookie.isNotEmpty) {
+            final sessionId = sidCookie.split(';').first;
+            // Save session to persistent storage
+            await _prefs.setString(_sessionKey, sessionId);
+            updateSessionCookie(sessionId);
+          }
+        }
+
         // Get user details including roles and IP
         final userResponse = await dio.get(
           '/api/method/frappe.auth.get_logged_user'
@@ -72,17 +102,25 @@ class AuthService extends BaseApiService {
               ...loginResponse.data,
               'user_details': userDetails['message']
             };
-          } else {
-            throw Exception('Failed to establish authenticated session');
           }
         }
+        throw Exception('Failed to establish authenticated session');
       }
       
       throw Exception('Login failed: Invalid response from server');
     } catch (e) {
-      // Clear session on login failure
-      updateSessionCookie(null);
+      await logout(); // Clear session on login failure
       throw handleError(e);
+    }
+  }
+
+  Future<void> logout() async {
+    try {
+      await _prefs.remove(_sessionKey);
+      updateSessionCookie(null);
+      await dio.get('/api/method/logout');
+    } catch (e) {
+      print('Error during logout: $e');
     }
   }
 
